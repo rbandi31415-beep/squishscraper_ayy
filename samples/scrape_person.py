@@ -14,7 +14,7 @@ async def main():
     profile_url = "https://www.linkedin.com/in/williamhgates/"
     
     # Initialize and start browser using context manager
-    async with BrowserManager(headless=True) as browser:
+    async with BrowserManager(headless=False) as browser:
         # Load existing session (must be created first - see README for setup)
         await browser.load_session("linkedin_session.json")
         print("✓ Session loaded")
@@ -34,7 +34,11 @@ async def main():
         print(f"Experiences: {len(person.experiences)}")
         print(f"Education: {len(person.educations)}")
         print("="*60)
-    
+
+        # Save as Markdown
+        output_path = person.save_markdown("output")
+        print(f"✓ Saved: {output_path}")
+
     print("\n✓ Done!")
 
 

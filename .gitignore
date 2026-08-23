@@ -35,6 +35,12 @@ debug_*.py
 # Session files (sensitive cookies)
 linkedin_session.json
 
+# Scraped output (contains scraped personal data - never commit)
+output/
+
+# Local Claude Code tooling state
+.claude/
+
 # Build artifacts
 MANIFEST
 MANIFEST.ini

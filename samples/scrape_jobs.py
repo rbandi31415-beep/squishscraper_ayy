@@ -11,7 +11,7 @@ from linkedin_scraper.core.browser import BrowserManager
 async def main():
     """Search for jobs and scrape details"""
     
-    async with BrowserManager(headless=True) as browser:
+    async with BrowserManager(headless=False) as browser:
         await browser.load_session("linkedin_session.json")
         print("✓ Session loaded")
         

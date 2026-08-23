@@ -15,7 +15,7 @@ async def main():
     profile_url = "https://www.linkedin.com/in/williamhgates/"
     
     # Initialize and start browser using context manager
-    async with BrowserManager(headless=True) as browser:
+    async with BrowserManager(headless=False) as browser:
         # Load existing session (must be created first - see README for setup)
         await browser.load_session("linkedin_session.json")
         print("✓ Session loaded")

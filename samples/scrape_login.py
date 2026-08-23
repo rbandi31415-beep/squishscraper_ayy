@@ -44,7 +44,7 @@ async def test_login_detection():
     print("Testing with authenticated session")
     print("-"*70)
     
-    async with BrowserManager(headless=True) as browser:
+    async with BrowserManager(headless=False) as browser:
         await browser.load_session(session_file)
         print("✓ Session loaded\n")
         
@@ -78,7 +78,7 @@ async def test_login_detection():
         print("Test: Login page in incognito context")
         print("  URL: https://www.linkedin.com/login")
         
-        async with BrowserManager(headless=True) as browser:
+        async with BrowserManager(headless=False) as browser:
             await browser.page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
             await asyncio.sleep(1)
             

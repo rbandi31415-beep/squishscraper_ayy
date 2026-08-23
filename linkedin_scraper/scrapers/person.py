@@ -1,6 +1,7 @@
 """Person/Profile scraper for LinkedIn."""
 
 import logging
+import re
 from typing import Optional
 from urllib.parse import urljoin
 from playwright.async_api import Page
@@ -112,14 +113,57 @@ class PersonScraper(BaseScraper):
     async def _get_name_and_location(self) -> tuple[str, Optional[str]]:
         """Extract name and location from profile."""
         try:
-            name = await self.safe_extract_text("h1", default="Unknown")
+            name = await self.safe_extract_text("h1", default="")
+            if not name:
+                # LinkedIn no longer renders the profile name as <h1> (hashed
+                # CSS-module classes, no stable hook) - it's the first <h2>
+                # inside <main>, after a visually-hidden nav heading.
+                for el in await self.page.locator("main h2").all():
+                    text = await el.text_content()
+                    if text and text.strip() and text.strip().lower() != "0 notifications":
+                        name = text.strip()
+                        break
+            if not name:
+                name = "Unknown"
+
             location = await self.safe_extract_text(
                 ".text-body-small.inline.t-black--light.break-words", default=""
             )
+            if not location:
+                location = await self._get_location_fallback()
+
             return name, location if location else None
         except Exception as e:
             logger.warning(f"Error getting name/location: {e}")
             return "Unknown", None
+
+    async def _get_location_fallback(self) -> Optional[str]:
+        """
+        Best-effort location lookup for the current top-card DOM, which has
+        no stable class names. Headline formatting varies too much to key
+        off ("Title @ Company" vs "Title, Company" vs plain text), so
+        instead we use a structural anchor: location is reliably the
+        paragraph immediately before a standalone "·" separator paragraph,
+        e.g. "<p>United States</p><p>·</p><p><a>Contact info</a></p>".
+        """
+        try:
+            name_heading = self.page.locator("main h2").first
+            if await name_heading.count() == 0:
+                return None
+            top_card = name_heading.locator("xpath=ancestor::*[8]")
+            if await top_card.count() == 0:
+                return None
+
+            paragraphs = await top_card.locator("p").all()
+            for i, p in enumerate(paragraphs):
+                text = await p.text_content()
+                if text and text.strip() == "·" and i > 0:
+                    prev_text = await paragraphs[i - 1].text_content()
+                    if prev_text and prev_text.strip():
+                        return prev_text.strip()
+            return None
+        except Exception:
+            return None
 
     async def _check_open_to_work(self) -> bool:
         """Check if profile has open to work badge."""
@@ -156,6 +200,170 @@ class PersonScraper(BaseScraper):
             logger.debug(f"Error getting about section: {e}")
             return None
 
+    async def _get_description_for_item(self, item) -> Optional[str]:
+        """
+        Extract the expandable description/notes text under an experience
+        entry, keyed off data-testid="expandable-text-box" - a stable,
+        semantic attribute rather than a hashed CSS class.
+
+        Strips out any nested "...more"/"...less" toggle button text by
+        temporarily removing button descendants from the *live* element
+        (not a detached clone) so innerText still reflects real layout and
+        preserves paragraph breaks, then puts them back afterward so the
+        page is left exactly as it was.
+        """
+        try:
+            box = item.locator('[data-testid="expandable-text-box"]').first
+            if await box.count() == 0:
+                return None
+
+            text = await box.evaluate(
+                """el => {
+                    const removed = Array.from(el.querySelectorAll('button'))
+                        .map(b => ({ b, parent: b.parentNode, next: b.nextSibling }));
+                    removed.forEach(({ b }) => b.remove());
+                    const text = el.innerText;
+                    removed.forEach(({ b, parent, next }) => {
+                        if (next) parent.insertBefore(b, next);
+                        else parent.appendChild(b);
+                    });
+                    return text;
+                }"""
+            )
+            text = text.strip() if text else ""
+            return text if text else None
+        except Exception:
+            return None
+
+    async def _logo_name_for_item(self, item) -> Optional[str]:
+        """
+        Get a card's company/institution name from its logo's <img alt="X
+        logo">. Nested sub-position items (multiple roles at one company,
+        grouped under a parent card) have no logo of their own - only the
+        parent card does - so this climbs to the nearest ancestor with a
+        componentkey if the item itself has no image.
+        """
+        img = item.locator("img[alt]").first
+        if await img.count() == 0:
+            parent = item.locator("xpath=ancestor::*[@componentkey][1]")
+            if await parent.count() > 0:
+                img = parent.locator("img[alt]").first
+
+        if await img.count() == 0:
+            return None
+
+        alt = await img.get_attribute("alt")
+        if alt and alt.lower().endswith(" logo"):
+            return alt[: -len(" logo")].strip()
+        return None
+
+    async def _find_section_container(self, heading, selector: str = "ul, ol", max_level: int = 8):
+        """
+        Find the section container for a main-page heading (e.g. Experience,
+        Education) by climbing ancestors one level at a time and stopping at
+        the first one containing a match for `selector`.
+
+        This replaces an earlier open-ended 'ancestor::*[.//ul or .//ol][1]'
+        xpath, which climbed with no distance limit: when a section's own
+        list isn't a few levels up (e.g. Education using a different layout
+        than Experience), it kept climbing until it hit *some* unrelated,
+        distant list elsewhere on the page (the activity feed, "People you
+        may know", etc.) and confidently returned the wrong section's items
+        instead of failing cleanly.
+        """
+        for level in range(1, max_level + 1):
+            ancestor = heading.locator(f"xpath=ancestor::*[{level}]")
+            if await ancestor.count() == 0:
+                break
+            if await ancestor.locator(selector).count() > 0:
+                return ancestor
+
+        if selector == "ul, ol":
+            fallback = heading.locator("xpath=ancestor::*[4]")
+            if await fallback.count() > 0:
+                return fallback
+        return None
+
+    async def _get_experiences_from_component_items(self, heading) -> list[Experience]:
+        """
+        Fallback for profiles where Experience entries aren't in a <ul>/<li>
+        the section container's bounded climb can find - instead using the
+        same componentkey^="entity-collection-item-" card marker as the
+        Education fallback, with each field as a separate <p> tag (title,
+        "Company · type", dates).
+
+        Grouped/nested entries (multiple roles at one company) put their
+        sub-roles in a nested <ul> inside the card; those are excluded here
+        (via not(ancestor::ul)) since the aggregate company header itself
+        has no single date range to anchor on - a known gap, same as the
+        nested-position case found on other profiles.
+        """
+        experiences = []
+        try:
+            section = await self._find_section_container(
+                heading, selector='[componentkey^="entity-collection-item-"]'
+            )
+            if section is None:
+                return experiences
+
+            items = await section.locator('[componentkey^="entity-collection-item-"]').all()
+
+            for item in items:
+                links = await item.locator('a').all()
+                company_url = await links[0].get_attribute('href') if links else None
+
+                logo_name = await self._logo_name_for_item(item)
+
+                texts = []
+                for p in await item.locator('xpath=.//p[not(ancestor::ul)]').all():
+                    text = await p.text_content()
+                    if text and text.strip():
+                        texts.append(text.strip())
+
+                if not texts:
+                    continue
+
+                date_idx = next(
+                    (i for i, t in enumerate(texts) if self._looks_like_date_range(t)),
+                    None,
+                )
+                if date_idx is None:
+                    # No date range among top-level text (e.g. a grouped
+                    # multi-role company header) - can't map to one entry.
+                    continue
+
+                pre_date = texts[:date_idx]
+                position_title = pre_date[0] if pre_date else ""
+                company_name = pre_date[1] if len(pre_date) > 1 else ""
+                if "·" in company_name:
+                    company_name = company_name.split("·")[0].strip()
+                if company_name.strip().lower() in self._EMPLOYMENT_TYPES:
+                    company_name = ""
+                if not company_name and logo_name:
+                    company_name = logo_name
+
+                if not position_title:
+                    continue
+
+                work_times = texts[date_idx]
+                from_date, to_date, duration = self._parse_work_times(work_times)
+                description = await self._get_description_for_item(item)
+
+                experiences.append(Experience(
+                    position_title=position_title,
+                    institution_name=company_name,
+                    linkedin_url=company_url,
+                    from_date=from_date,
+                    to_date=to_date,
+                    duration=duration,
+                    location=None,
+                    description=description,
+                ))
+        except Exception as e:
+            logger.debug(f"Error in experience componentkey fallback: {e}")
+
+        return experiences
+
     async def _get_experiences(self, base_url: str) -> list[Experience]:
         """Extract experiences from the main profile page Experience section."""
         experiences = []
@@ -164,11 +372,9 @@ class PersonScraper(BaseScraper):
             experience_heading = self.page.locator('h2:has-text("Experience")').first
             
             if await experience_heading.count() > 0:
-                experience_section = experience_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
-                if await experience_section.count() == 0:
-                    experience_section = experience_heading.locator('xpath=ancestor::*[4]')
-                
-                if await experience_section.count() > 0:
+                experience_section = await self._find_section_container(experience_heading)
+
+                if experience_section is not None:
                     items = await experience_section.locator('ul > li, ol > li').all()
                     
                     for item in items:
@@ -179,7 +385,10 @@ class PersonScraper(BaseScraper):
                         except Exception as e:
                             logger.debug(f"Error parsing experience from main page: {e}")
                             continue
-            
+
+            if not experiences and await experience_heading.count() > 0:
+                experiences = await self._get_experiences_from_component_items(experience_heading)
+
             if not experiences:
                 exp_url = urljoin(base_url, "details/experience")
                 await self.navigate_and_wait(exp_url)
@@ -220,26 +429,95 @@ class PersonScraper(BaseScraper):
         return experiences
     
     async def _parse_main_page_experience(self, item) -> Optional[Experience]:
-        """Parse experience from main profile page list item with [logo_link, details_link] structure."""
+        """Parse experience from main profile page list item.
+
+        LinkedIn sometimes wraps the whole card (logo + details) in a
+        single <a>, and sometimes uses two separate links. Either way, the
+        date range is the only reliably identifiable field by position, so
+        text fields are classified relative to it rather than assumed by
+        fixed index (grouped/nested-position cards have no separate company
+        name text, which broke a purely positional mapping).
+        """
         try:
             links = await item.locator('a').all()
-            if len(links) < 2:
+            if not links:
                 return None
-            
+
             company_url = await links[0].get_attribute('href')
-            detail_link = links[1]
-            
-            unique_texts = await self._extract_unique_texts_from_element(detail_link)
-            
-            if len(unique_texts) < 2:
+            detail_link = links[1] if len(links) > 1 else links[0]
+
+            logo_name = await self._logo_name_for_item(item)
+
+            # Prefer direct <p> tags when present - some profiles render
+            # title/type/dates as clean separate paragraphs rather than the
+            # <span aria-hidden="true"> structure _extract_unique_texts...
+            # was built for. Without this, an outer wrapping <div> gets
+            # matched instead (span-based extraction finds nothing to
+            # anchor on) and all paragraphs' text comes back concatenated
+            # into one blob, e.g. "TitleFull-timeMar 2024 - Present...".
+            #
+            # No ancestor::ul exclusion here (unlike the componentkey-based
+            # method): this item is already one atomic <li> - possibly
+            # itself a nested sub-role unpacked by the ul > li search - so
+            # its own <p> tags are already properly scoped to just this
+            # entry, with no further nested sub-list inside to worry about.
+            direct_paragraphs = await detail_link.locator('p').all()
+            if len(direct_paragraphs) >= 2:
+                unique_texts = []
+                for p in direct_paragraphs:
+                    text = await p.text_content()
+                    if text and text.strip():
+                        unique_texts.append(text.strip())
+            else:
+                unique_texts = await self._extract_unique_texts_from_element(detail_link)
+
+            if not unique_texts:
                 return None
-            
-            position_title = unique_texts[0]
-            company_name = unique_texts[1]
-            work_times = unique_texts[2] if len(unique_texts) > 2 else ""
-            
+
+            # Merged-blob case: the outer wrapping span swallows all inner
+            # text with no separators at all, e.g.
+            # "Team 1 AmbassadorJan 2025 - Present · 1 yr 8 moPhiladelphia..."
+            # Split it using the date range as an anchor point.
+            if len(unique_texts) == 1:
+                split = self._split_merged_experience_text(unique_texts[0])
+                if split:
+                    unique_texts = split
+
+            date_idx = next(
+                (i for i, t in enumerate(unique_texts) if self._looks_like_date_range(t)),
+                None,
+            )
+
+            location = None
+            if date_idx is None:
+                position_title = unique_texts[0]
+                company_name = unique_texts[1] if len(unique_texts) > 1 else ""
+                work_times = unique_texts[2] if len(unique_texts) > 2 else ""
+            else:
+                pre_date = unique_texts[:date_idx]
+                position_title = pre_date[0] if pre_date else ""
+                company_name = pre_date[1] if len(pre_date) > 1 else ""
+                work_times = unique_texts[date_idx]
+                if len(unique_texts) > date_idx + 1:
+                    location = unique_texts[date_idx + 1]
+
+            # An employment-type word ("Full-time" etc.) isn't a company
+            # name - some profiles render it as its own paragraph right
+            # where company name would otherwise be.
+            if company_name.strip().lower() in self._EMPLOYMENT_TYPES:
+                company_name = ""
+
+            # Grouped/nested-position cards have no separate company name
+            # text on the main page - fall back to the logo's alt text.
+            if not company_name and logo_name:
+                company_name = logo_name
+
+            if not position_title:
+                return None
+
             from_date, to_date, duration = self._parse_work_times(work_times)
-            
+            description = await self._get_description_for_item(item)
+
             return Experience(
                 position_title=position_title,
                 institution_name=company_name,
@@ -247,13 +525,63 @@ class PersonScraper(BaseScraper):
                 from_date=from_date,
                 to_date=to_date,
                 duration=duration,
-                location=None,
-                description=None,
+                location=location,
+                description=description,
             )
-            
+
         except Exception as e:
             logger.debug(f"Error parsing main page experience: {e}")
             return None
+
+    _MONTH_ABBRS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+    _EMPLOYMENT_TYPES = frozenset({
+        "full-time", "part-time", "self-employed", "freelance",
+        "contract", "internship", "apprenticeship", "seasonal",
+    })
+
+    _DATE_CHUNK_RE = re.compile(
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\s*-\s*"
+        r"(?:Present|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})"
+        r"(?:\s*·\s*\d+\s*(?:yrs?|mos?)(?:\s*\d+\s*(?:yrs?|mos?))?)?",
+        re.IGNORECASE,
+    )
+
+    def _split_merged_experience_text(self, text: str) -> Optional[list]:
+        """
+        Split a merged "TitleDATE_RANGELocation" blob (no separators between
+        fields) into [title, date_range, location], using the date range as
+        an anchor. Returns None if no date range pattern is found, meaning
+        this text isn't this merged-blob shape.
+        """
+        match = self._DATE_CHUNK_RE.search(text)
+        if not match:
+            return None
+
+        title = text[: match.start()].strip()
+        date_range = match.group().strip()
+        location = text[match.end():].strip()
+
+        if not title:
+            return None
+
+        parts = [title, date_range]
+        if location:
+            parts.append(location)
+        return parts
+
+    def _looks_like_date_range(self, text: str) -> bool:
+        """Heuristic: does this text look like a work/education date range?"""
+        if not text:
+            return False
+        t = text.lower()
+        if "present" in t:
+            return True
+        if any(m in t for m in self._MONTH_ABBRS):
+            return True
+        if re.search(r"\b(19|20)\d{2}\b", t):
+            return True
+        return False
     
     async def _extract_unique_texts_from_element(self, element) -> list[str]:
         """Extract unique text content from nested elements, avoiding duplicates from parent/child overlap."""
@@ -518,6 +846,166 @@ class PersonScraper(BaseScraper):
             logger.debug(f"Error parsing work times '{work_times}': {e}")
             return None, None, None
 
+    # LinkedIn renders education date ranges with an en-dash ("1999 – 2001"),
+    # not the plain hyphen _parse_education_times() splits on, so this is
+    # parsed directly via capture groups rather than routed through that
+    # helper.
+    _YEAR_RANGE_RE = re.compile(r"(\d{4})\s*[–-]\s*(\d{4})|(\d{4})")
+
+    async def _get_educations_from_school_links(self) -> list[Education]:
+        """
+        Fallback for profiles where Education has no <ul>/<li> markup: each
+        entry is instead two sibling <a> tags (a logo-only link and a
+        detail link with name/degree/dates all merged into one blob, no
+        separators) sharing the same /school/ href. The logo link's <img
+        alt="X logo"> gives a clean institution name that sidesteps the
+        merged-text ambiguity; degree/dates are split out of the detail
+        link's blob using the institution name as a known prefix plus a
+        year-range as an anchor.
+        """
+        educations = []
+        try:
+            links = await self.page.locator('main a[href*="/school/"]').all()
+
+            href_to_links: dict = {}
+            ordered_hrefs = []
+            for link in links:
+                href = await link.get_attribute('href')
+                if not href:
+                    continue
+                if href not in href_to_links:
+                    href_to_links[href] = []
+                    ordered_hrefs.append(href)
+                href_to_links[href].append(link)
+
+            for href in ordered_hrefs:
+                pair = href_to_links[href]
+
+                logo_name = None
+                detail_link = None
+                detail_len = -1
+                for link in pair:
+                    img = link.locator("img[alt]").first
+                    if await img.count() > 0:
+                        alt = await img.get_attribute("alt")
+                        if alt and alt.lower().endswith(" logo"):
+                            logo_name = alt[: -len(" logo")].strip()
+                    text = await link.text_content()
+                    length = len(text.strip()) if text else 0
+                    if length > detail_len:
+                        detail_len = length
+                        detail_link = link
+
+                if detail_link is None or detail_len == 0:
+                    continue
+
+                blob = (await detail_link.text_content() or "").strip()
+
+                remainder = blob
+                institution_name = logo_name
+                if institution_name and blob.startswith(institution_name):
+                    remainder = blob[len(institution_name):]
+                elif not institution_name:
+                    # No logo alt text available - can't cleanly separate
+                    # institution from degree, so keep the whole blob as
+                    # institution_name rather than guess wrong.
+                    institution_name = blob
+                    remainder = ""
+
+                degree = None
+                from_date = None
+                to_date = None
+                if remainder:
+                    match = self._YEAR_RANGE_RE.search(remainder)
+                    if match:
+                        degree = remainder[: match.start()].strip()
+                        if match.group(1) and match.group(2):
+                            from_date, to_date = match.group(1), match.group(2)
+                        else:
+                            from_date = to_date = match.group(3)
+                    else:
+                        degree = remainder.strip()
+
+                educations.append(Education(
+                    institution_name=institution_name,
+                    degree=degree if degree else None,
+                    linkedin_url=href,
+                    from_date=from_date,
+                    to_date=to_date,
+                    description=None,
+                ))
+        except Exception as e:
+            logger.debug(f"Error in education school-link fallback: {e}")
+
+        return educations
+
+    async def _get_educations_from_component_items(self, heading) -> list[Education]:
+        """
+        Fallback for profiles where Education entries have no clickable
+        link at all (this happens once a profile has enough entries that
+        LinkedIn shows a "Show all N educations" summary card instead of
+        individually-linked items) but still render full text as separate
+        <p> tags. LinkedIn marks every repeated card item generically -
+        regardless of section or whether it's link-wrapped - with a
+        componentkey starting "entity-collection-item-" (sometimes with a
+        second hyphen depending on the generated hash, so matched by
+        single-hyphen prefix), which is a much more stable hook here than
+        trying to key off links or a specific DOM shape.
+        """
+        educations = []
+        try:
+            section = await self._find_section_container(
+                heading, selector='[componentkey^="entity-collection-item-"]'
+            )
+            if section is None:
+                return educations
+
+            items = await section.locator('[componentkey^="entity-collection-item-"]').all()
+
+            for item in items:
+                texts = []
+                for p in await item.locator("p").all():
+                    text = await p.text_content()
+                    if text and text.strip():
+                        texts.append(text.strip())
+
+                if not texts:
+                    continue
+
+                institution_name = texts[0]
+                degree = None
+                from_date = None
+                to_date = None
+
+                rest = texts[1:]
+                date_idx = next(
+                    (i for i, t in enumerate(rest) if self._YEAR_RANGE_RE.search(t)),
+                    None,
+                )
+                if date_idx is not None:
+                    if date_idx > 0:
+                        degree = rest[0]
+                    match = self._YEAR_RANGE_RE.search(rest[date_idx])
+                    if match.group(1) and match.group(2):
+                        from_date, to_date = match.group(1), match.group(2)
+                    else:
+                        from_date = to_date = match.group(3)
+                elif rest:
+                    degree = rest[0]
+
+                educations.append(Education(
+                    institution_name=institution_name,
+                    degree=degree,
+                    linkedin_url=None,
+                    from_date=from_date,
+                    to_date=to_date,
+                    description=None,
+                ))
+        except Exception as e:
+            logger.debug(f"Error in education componentkey fallback: {e}")
+
+        return educations
+
     async def _get_educations(self, base_url: str) -> list[Education]:
         """Extract educations from the main profile page Education section."""
         educations = []
@@ -526,11 +1014,9 @@ class PersonScraper(BaseScraper):
             education_heading = self.page.locator('h2:has-text("Education")').first
             
             if await education_heading.count() > 0:
-                education_section = education_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
-                if await education_section.count() == 0:
-                    education_section = education_heading.locator('xpath=ancestor::*[4]')
-                
-                if await education_section.count() > 0:
+                education_section = await self._find_section_container(education_heading)
+
+                if education_section is not None:
                     items = await education_section.locator('ul > li, ol > li').all()
                     
                     for item in items:
@@ -541,7 +1027,22 @@ class PersonScraper(BaseScraper):
                         except Exception as e:
                             logger.debug(f"Error parsing education from main page: {e}")
                             continue
-            
+
+            if not educations:
+                # Some profiles render Education with no <ul>/<li> at all -
+                # just two sibling <a> tags per entry (logo link + detail
+                # link) sharing the same /school/... href, with no list
+                # wrapper. /school/ links only ever appear in this section
+                # (the top-card summary line is plain text, not a link), so
+                # searching page-wide is safe here.
+                educations = await self._get_educations_from_school_links()
+
+            if not educations and await education_heading.count() > 0:
+                # Some profiles (once there are 3+ entries) render Education
+                # with no clickable link at all - just plain text in a
+                # repeated card structure.
+                educations = await self._get_educations_from_component_items(education_heading)
+
             if not educations:
                 edu_url = urljoin(base_url, "details/education")
                 await self.navigate_and_wait(edu_url)
